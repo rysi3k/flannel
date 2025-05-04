@@ -185,10 +185,19 @@ func newKubeSubnetManager(ctx context.Context, c clientset.Interface, sc *subnet
 		indexer, controller := cache.NewIndexerInformer(
 			&cache.ListWatch{
 				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+					log.Infof("Listing nodes")
 					return ksm.client.CoreV1().Nodes().List(ctx, options)
 				},
 				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					return ksm.client.CoreV1().Nodes().Watch(ctx, options)
+					log.Infof("Watching nodes")
+					ch := make(chan watch.Event)
+
+					go func() {
+							time.Sleep(resyncPeriod)
+							close(ch)
+					}()
+
+					return watch.NewProxyWatcher(ch), nil
 				},
 			},
 			&v1.Node{},
@@ -221,6 +230,49 @@ func newKubeSubnetManager(ctx context.Context, c clientset.Interface, sc *subnet
 		)
 		ksm.nodeController = controller
 		ksm.nodeStore = listers.NewNodeLister(indexer)
+
+		manualResyncPeriodEnv, exists := os.LookupEnv("MANUAL_RESYNC_PERIOD_MINUTES")
+		var manualResyncPeriod time.Duration
+		if !exists {
+			manualResyncPeriod = resyncPeriod
+		} else {
+			v, _ := strconv.ParseInt(manualResyncPeriodEnv, 10, 32)
+			manualResyncPeriod = time.Duration(v) * time.Minute
+		}
+		ticker := time.NewTicker(manualResyncPeriod)
+		go func() {
+				for {
+						<-ticker.C
+						nodeList, err := ksm.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+						if err != nil {
+							log.Infof("Error during resync: %v", err)
+								continue
+						}
+
+						existingNodes := map[string]struct{}{}
+						for _, node := range nodeList.Items {
+								existingNodes[node.Name] = struct{}{}
+								_, exists, err := indexer.GetByKey(node.Name)
+								if exists && err == nil {
+										indexer.Update(&node)
+										log.Infof("Update (resync): %s", node.Name)
+								} else {
+										// nowy obiekt
+										indexer.Add(&node)
+										log.Infof("Add (resync): %s", node.Name)
+								}
+						}
+
+						cachedNodes := indexer.List()
+						for _, obj := range cachedNodes {
+								cachedNode := obj.(*v1.Node)
+								if _, exists := existingNodes[cachedNode.Name]; !exists {
+										indexer.Delete(cachedNode)
+										log.Infof("Delete (resync): %s", cachedNode.Name)
+								}
+						}
+				}
+		}()
 	}
 
 	return &ksm, nil
