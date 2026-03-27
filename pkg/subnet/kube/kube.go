@@ -16,6 +16,7 @@ package kube
 
 import (
 	"context"
+	"k8s.io/apimachinery/pkg/runtime"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,8 +33,8 @@ import (
 	"golang.org/x/sync/semaphore"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clientset "k8s.io/client-go/kubernetes"
@@ -76,6 +77,7 @@ type kubeSubnetManager struct {
 	setNodeNetworkUnavailable bool
 	disableNodeInformer       bool
 	snFileInfo                *subnetFileInfo
+	manualNodeCache           map[string]*v1.Node
 }
 
 func NewSubnetManager(ctx context.Context, apiUrl, kubeconfig, prefix, netConfPath string, setNodeNetworkUnavailable bool) (subnet.Manager, error) {
@@ -194,17 +196,34 @@ func newKubeSubnetManager(ctx context.Context, c clientset.Interface, sc *subnet
 	}
 	ksm.events = make(chan lease.Event, scale)
 	ksm.asyncSendSemaphore = semaphore.NewWeighted(100)
+	ksm.manualNodeCache = make(map[string]*v1.Node)
 	// when backend type is alloc, someone else (e.g. cloud-controller-managers) is taking care of the routing, thus we do not need informer
 	// See https://github.com/flannel-io/flannel/issues/1617
 	if sc.BackendType == "alloc" {
 		ksm.disableNodeInformer = true
 	}
 	if !ksm.disableNodeInformer {
-		listerWatcher := cache.NewListWatchFromClient(
-			ksm.client.CoreV1().RESTClient(),
-			"nodes",
-			"",
-			fields.Everything())
+  	listerWatcher := &cache.ListWatch{
+  		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+  			log.Infof("Listing nodes")
+  			return ksm.client.CoreV1().Nodes().List(ctx, options)
+  		},
+  		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+  			log.Infof("Watching nodes with proxy watcher")
+  			ch := make(chan watch.Event)
+  			go func() {
+  				timer := time.NewTimer(resyncPeriod)
+  				defer timer.Stop()
+  				defer close(ch)
+  				select {
+  				case <-ctx.Done():
+  				case <-timer.C:
+  				}
+  			}()
+  			return watch.NewProxyWatcher(ch), nil
+  		},
+  	}
+
 
 		handler := cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
@@ -242,48 +261,140 @@ func newKubeSubnetManager(ctx context.Context, c clientset.Interface, sc *subnet
 
 		ksm.nodeController = controller
 		ksm.nodeStore = store
+
+	manualResyncPeriodEnv, exists := os.LookupEnv("MANUAL_RESYNC_PERIOD_MINUTES")
+	var manualResyncPeriod time.Duration
+	if !exists {
+		manualResyncPeriod = resyncPeriod
+	} else {
+		v, err := strconv.ParseInt(manualResyncPeriodEnv, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("env MANUAL_RESYNC_PERIOD_MINUTES=%s format error: %v", manualResyncPeriodEnv, err)
+		}
+		if v <= 0 {
+			return nil, fmt.Errorf("env MANUAL_RESYNC_PERIOD_MINUTES must be > 0, got: %d", v)
+		}
+		manualResyncPeriod = time.Duration(v) * time.Minute
+	}
+
+	go func() {
+		if !cache.WaitForCacheSync(ctx.Done(), controller.HasSynced) {
+			log.Infof("Node cache did not sync before manual resync loop start")
+			return
+		}
+
+		for _, obj := range store.List() {
+			node, ok := obj.(*v1.Node)
+			if !ok {
+				continue
+			}
+			ksm.manualNodeCache[node.Name] = node.DeepCopy()
+		}
+
+		log.Infof("Starting manual node resync loop, interval=%s, initial_cached_nodes=%d", manualResyncPeriod, len(ksm.manualNodeCache))
+
+		ticker := time.NewTicker(manualResyncPeriod)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				log.Infof("Stopping manual node resync loop")
+				return
+			case <-ticker.C:
+			}
+
+			tickStart := time.Now()
+			addedCount := 0
+			updatedCount := 0
+			readyRecoveredCount := 0
+			deletedCount := 0
+			log.Infof("Manual node resync tick started at %s", tickStart.Format(time.RFC3339))
+
+			nodeList, err := ksm.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+			if err != nil {
+				log.Infof("Manual node resync failed after %s: %v", time.Since(tickStart), err)
+				continue
+			}
+			log.Infof("Manual node resync fetched %d nodes in %s", len(nodeList.Items), time.Since(tickStart))
+
+			current := make(map[string]*v1.Node, len(nodeList.Items))
+			for i := range nodeList.Items {
+				node := nodeList.Items[i].DeepCopy()
+				current[node.Name] = node
+
+				oldNode, exists := ksm.manualNodeCache[node.Name]
+				if !exists {
+					if ksm.isNodeManaged(node) {
+						addedCount++
+						log.Infof("Add (manual resync): node=%s managed=%v ready=%s podCIDR=%s", node.Name, ksm.isNodeManaged(node), ksm.nodeReadyStatus(node), node.Spec.PodCIDR)
+						ksm.handleAddLeaseEvent(ctx, lease.EventAdded, node)
+					}
+					continue
+				}
+
+				if reasons := ksm.manualNodeChangeReasons(oldNode, node); len(reasons) > 0 {
+					updatedCount++
+					log.Infof("Update (manual resync): node=%s reasons=%s ready_old=%s ready_new=%s", node.Name, strings.Join(reasons, ","), ksm.nodeReadyStatus(oldNode), ksm.nodeReadyStatus(node))
+					ksm.emitManualNodeTransition(ctx, oldNode, node)
+				} else if ksm.nodeRecoveredToReady(oldNode, node) && ksm.isNodeManaged(node) {
+					readyRecoveredCount++
+					log.Infof("Ready recovery (manual resync): node=%s ready_old=%s ready_new=%s podCIDR=%s", node.Name, ksm.nodeReadyStatus(oldNode), ksm.nodeReadyStatus(node), node.Spec.PodCIDR)
+					ksm.handleAddLeaseEvent(ctx, lease.EventAdded, node)
+				}
+			}
+
+			for name, oldNode := range ksm.manualNodeCache {
+				if _, exists := current[name]; !exists {
+					if ksm.isNodeManaged(oldNode) {
+						deletedCount++
+						log.Infof("Delete (manual resync): node=%s managed=%v ready_last=%s podCIDR_last=%s", name, ksm.isNodeManaged(oldNode), ksm.nodeReadyStatus(oldNode), oldNode.Spec.PodCIDR)
+						ksm.handleAddLeaseEvent(ctx, lease.EventRemoved, oldNode)
+					}
+				}
+			}
+
+			ksm.manualNodeCache = current
+			log.Infof("Manual node resync tick finished in %s: total=%d added=%d updated=%d ready_recovered=%d deleted=%d", time.Since(tickStart), len(nodeList.Items), addedCount, updatedCount, readyRecoveredCount, deletedCount)
+		}
+	}()
 	}
 
 	return &ksm, nil
 }
 
 func (ksm *kubeSubnetManager) enqueueLeaseEvent(ctx context.Context, evt lease.Event, nodeName string) {
-	// Try to send immediately
 	select {
 	case ksm.events <- evt:
+		log.Infof("Lease event enqueued immediately: type=%v node=%s", evt.Type, nodeName)
 		return
 	default:
-		log.Infof("Channel buffer full, add event asynchronously")
+		log.Infof("Channel buffer full, queue event asynchronously: type=%v node=%s", evt.Type, nodeName)
 	}
 
-	// Instead of select with default, *block* until a slot is free
-	// Use a context with no timeout to block until a slot is available
 	if err := ksm.asyncSendSemaphore.Acquire(ctx, 1); err != nil {
-		log.Errorf("error in acquiring semaphore for async event send, dropping event: %v", err)
+		log.Errorf("Error acquiring semaphore for async event send for node %q, dropping event type=%v: %v", nodeName, evt.Type, err)
 		return
 	}
 
 	go func() {
-		defer func() { ksm.asyncSendSemaphore.Release(1) }() // release slot when done
+		defer ksm.asyncSendSemaphore.Release(1)
 
 		backoff := 100 * time.Millisecond
 		maxBackoff := 5 * time.Second
 
 		for {
-
-			ticker := time.NewTicker(backoff)
+			timer := time.NewTimer(backoff)
 			select {
 			case <-ctx.Done():
-				log.Errorf("Context cancelled while retrying lease event for node %q", nodeName)
-				ticker.Stop()
+				timer.Stop()
+				log.Infof("Context cancelled while retrying lease event for node %q", nodeName)
 				return
 			case ksm.events <- evt:
-				log.Infof("Async requeued lease event for node %q", nodeName)
-				ticker.Stop()
+				timer.Stop()
+				log.Infof("Lease event queued asynchronously: type=%v node=%s", evt.Type, nodeName)
 				return
-			default:
-				// events channel still full, retry with exp backoff
-				ticker.Stop()
+			case <-timer.C:
 				backoff *= 2
 				if backoff > maxBackoff {
 					backoff = maxBackoff
@@ -304,8 +415,101 @@ func (ksm *kubeSubnetManager) handleAddLeaseEvent(ctx context.Context, et lease.
 		log.Infof("Error turning node %q to lease: %v", n.Name, err)
 		return
 	}
+	log.Infof("Queueing lease event: type=%v node=%s ready=%s podCIDR=%s", et, n.Name, ksm.nodeReadyStatus(n), n.Spec.PodCIDR)
 	ksm.enqueueLeaseEvent(ctx, lease.Event{Type: et, Lease: l}, n.Name)
 }
+
+
+func (ksm *kubeSubnetManager) isNodeManaged(n *v1.Node) bool {
+	if n == nil {
+		return false
+	}
+	return n.Annotations[ksm.annotations.SubnetKubeManaged] == "true"
+}
+
+func (ksm *kubeSubnetManager) nodeReadyStatus(n *v1.Node) v1.ConditionStatus {
+	if n == nil {
+		return v1.ConditionUnknown
+	}
+
+	for _, condition := range n.Status.Conditions {
+		if condition.Type == v1.NodeReady {
+			return condition.Status
+		}
+	}
+
+	return v1.ConditionUnknown
+}
+
+func (ksm *kubeSubnetManager) nodeRecoveredToReady(oldNode, newNode *v1.Node) bool {
+	oldReady := ksm.nodeReadyStatus(oldNode)
+	newReady := ksm.nodeReadyStatus(newNode)
+	return oldReady != v1.ConditionTrue && newReady == v1.ConditionTrue
+}
+
+func (ksm *kubeSubnetManager) manualNodeChangeReasons(oldNode, newNode *v1.Node) []string {
+	reasons := []string{}
+
+	if oldNode == nil || newNode == nil {
+		return []string{"node_nil"}
+	}
+
+	if ksm.isNodeManaged(oldNode) != ksm.isNodeManaged(newNode) {
+		reasons = append(reasons, "managed_changed")
+	}
+
+	if oldNode.Spec.PodCIDR != newNode.Spec.PodCIDR {
+		reasons = append(reasons, "podcidr_changed")
+	}
+
+	if len(oldNode.Spec.PodCIDRs) != len(newNode.Spec.PodCIDRs) {
+		reasons = append(reasons, "podcidrs_len_changed")
+	} else {
+		for i := range oldNode.Spec.PodCIDRs {
+			if oldNode.Spec.PodCIDRs[i] != newNode.Spec.PodCIDRs[i] {
+				reasons = append(reasons, "podcidrs_changed")
+				break
+			}
+		}
+	}
+
+	if oldNode.Annotations[ksm.annotations.BackendType] != newNode.Annotations[ksm.annotations.BackendType] {
+		reasons = append(reasons, "backend_type_changed")
+	}
+	if oldNode.Annotations[ksm.annotations.BackendData] != newNode.Annotations[ksm.annotations.BackendData] {
+		reasons = append(reasons, "backend_data_changed")
+	}
+	if oldNode.Annotations[ksm.annotations.BackendPublicIP] != newNode.Annotations[ksm.annotations.BackendPublicIP] {
+		reasons = append(reasons, "backend_public_ip_changed")
+	}
+	if oldNode.Annotations[ksm.annotations.BackendV6Data] != newNode.Annotations[ksm.annotations.BackendV6Data] {
+		reasons = append(reasons, "backend_v6_data_changed")
+	}
+	if oldNode.Annotations[ksm.annotations.BackendPublicIPv6] != newNode.Annotations[ksm.annotations.BackendPublicIPv6] {
+		reasons = append(reasons, "backend_public_ipv6_changed")
+	}
+
+	return reasons
+}
+
+func (ksm *kubeSubnetManager) manualNodeChanged(oldNode, newNode *v1.Node) bool {
+	return len(ksm.manualNodeChangeReasons(oldNode, newNode)) > 0
+}
+
+func (ksm *kubeSubnetManager) emitManualNodeTransition(ctx context.Context, oldNode, newNode *v1.Node) {
+	oldManaged := ksm.isNodeManaged(oldNode)
+	newManaged := ksm.isNodeManaged(newNode)
+
+	switch {
+	case !oldManaged && newManaged:
+		ksm.handleAddLeaseEvent(ctx, lease.EventAdded, newNode)
+	case oldManaged && !newManaged:
+		ksm.handleAddLeaseEvent(ctx, lease.EventRemoved, oldNode)
+	case oldManaged && newManaged:
+		ksm.handleUpdateLeaseEvent(ctx, oldNode, newNode)
+	}
+}
+
 
 // handleUpdateLeaseEvent verifies if anything relevant changed in the node object: either
 // ksm.annotations.BackendData, ksm.annotations.BackendType or ksm.annotations.BackendPublicIP
@@ -337,6 +541,7 @@ func (ksm *kubeSubnetManager) handleUpdateLeaseEvent(ctx context.Context, oldObj
 		log.Infof("Error turning node %q to lease: %v", n.Name, err)
 		return
 	}
+	log.Infof("Queueing lease update event: node=%s ready_old=%s ready_new=%s", n.Name, ksm.nodeReadyStatus(o), ksm.nodeReadyStatus(n))
 	ksm.enqueueLeaseEvent(ctx, lease.Event{Type: lease.EventAdded, Lease: l}, n.Name)
 }
 
